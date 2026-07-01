@@ -1,7 +1,6 @@
 ---
-name: Lint
-'on':
-  pull_request:
+name: Build
+on:
   push:
     branches:
       - main
@@ -9,7 +8,7 @@ name: Lint
 jobs:
 
   test:
-    name: Lint
+    name: Build Ansible Galaxy collection artifact.
     runs-on: ubuntu-latest
 
     steps:
@@ -22,10 +21,13 @@ jobs:
           python-version: '3.13.x'
 
       - name: Install test dependencies.
-        run: pip3 install yamllint ansible-lint ansible
+        run: pip3 install ansible
 
-      - name: Run yamllint.
-        run: yamllint .
+      - name: Build artifact.
+        run: ansible-galaxy collection build
 
-      - name: Run ansible-lint.
-        run: ansible-lint
+      - name: Upload artifact.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: galaxy-collection
+          path: k3s-orchestration-*.tar.gz

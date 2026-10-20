@@ -3,12 +3,17 @@
   ansible.builtin.command: k3s --version
   register: k3s_server_version_output
   changed_when: false
-  ignore_errors: true
+  failed_when: false
 
 - name: Set k3s installed version
   when: not ansible_check_mode and k3s_server_version_output.rc == 0
   ansible.builtin.set_fact:
     k3s_server_installed_version: "{{ k3s_server_version_output.stdout_lines[0].split(' ')[2] }}"
+
+# Limit join checks to completed and current batches during serial installation.
+- name: Count the servers this play has already started
+  ansible.builtin.set_fact:
+    k3s_server_started_count: "{{ ansible_play_hosts_all.index(ansible_play_batch[-1]) + 1 }}"
 
 - name: Construct K3s server config
   block:
@@ -48,7 +53,7 @@
     - name: Add TLS SAN to config if needed
       when:
         - api_endpoint is defined
-        - api_endpoint != ansible_hostname
+        - api_endpoint != ansible_facts['hostname']
         - not (_api_endpoint_in_config | trim | bool)
         - not (_api_endpoint_in_args | trim | bool)
       ansible.builtin.set_fact:
@@ -67,7 +72,7 @@
     - name: Add server URL to server config for joining servers in HA-IC setup
       when: (groups[server_group] | length) > 1 and inventory_hostname != groups[server_group][0] and not use_external_database
       ansible.builtin.set_fact:
-        k3s_server_config: "{{ k3s_server_config | combine({'server': 'https://' + api_endpoint + ':' + api_port | string}) }}"
+        k3s_server_config: "{{ k3s_server_config | combine({'server': 'https://' + (api_endpoint | ansible.utils.ipwrap) + ':' + api_port | string}) }}"
 
     # If the user has provided additional server config, merge it with the generated config
     - name: Merge user server config with generated server config
@@ -147,13 +152,12 @@
 - name: Init first server node
   when: inventory_hostname == groups[server_group][0] or ansible_host == groups[server_group][0]
   block:
-
     - name: Convert server config to YAML and write to file
       when: not ansible_check_mode
       ansible.builtin.copy:
         content: "{{ k3s_server_config | to_nice_yaml }}"
         dest: "/etc/rancher/k3s/config.yaml"
-        mode: "0644"
+        mode: "{{ k3s_server_config_mode }}"
       register: k3s_server_config_result
 
     - name: Delete any existing token from the environment if different from the new one
@@ -170,6 +174,7 @@
         daemon_reload: true
 
     - name: Enable and start K3s service
+      when: not ansible_check_mode
       ansible.builtin.service:
         name: k3s
         state: restarted
@@ -194,6 +199,7 @@
     # If no changes are found, we can skip copying the kubeconfig to the control node.
     # This is dependent on the speed of the target node for k3s startup time, so retries are used.
     - name: Copy k3s.yaml to second file
+      when: not ansible_check_mode
       ansible.builtin.copy:
         src: /etc/rancher/k3s/k3s.yaml
         dest: /etc/rancher/k3s/k3s-copy.yaml
@@ -215,7 +221,7 @@
 
         - name: Change server address in kubeconfig on control node
           ansible.builtin.shell: |
-            KUBECONFIG={{ kubeconfig }} kubectl config set-cluster default --server=https://{{ api_endpoint }}:{{ api_port }}
+            KUBECONFIG={{ kubeconfig }} kubectl config set-cluster default --server=https://{{ api_endpoint | ansible.utils.ipwrap }}:{{ api_port }}
           delegate_to: 127.0.0.1
           become: false
           register: k3s_server_csa_result
@@ -245,7 +251,9 @@
             - k3s_server_mv_result.rc == 0
 
     - name: Get the token if randomly generated
-      when: token is not defined
+      when:
+        - not ansible_check_mode
+        - token is not defined
       block:
         - name: Wait for token
           ansible.builtin.wait_for:
@@ -266,7 +274,6 @@
     - (groups[server_group] | length) > 1
     - inventory_hostname != groups[server_group][0] and ansible_host != groups[server_group][0]
   block:
-
     - name: Get token from first server if needed
       when: token is not defined and hostvars[groups[server_group][0]].random_token is defined
       # noqa var-naming[no-role-prefix]
@@ -278,7 +285,7 @@
       ansible.builtin.copy:
         content: "{{ k3s_server_config | to_nice_yaml }}"
         dest: "/etc/rancher/k3s/config.yaml"
-        mode: "0644"
+        mode: "{{ k3s_server_config_mode }}"
       register: k3s_server_config_result
 
     - name: Delete any existing token from the environment if different from the new one
@@ -294,11 +301,14 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
+    # Always restart a joined server so a re-run of site.yml — whether it only
+    # bumped k3s_version or changed config — brings it onto the new runtime, the
+    # same way the first server above always restarts. On a multi-server cluster
+    # set k3s_server_serial to 1 so the servers restart one at a time (see README).
     - name: Restart K3s service
       when:
         - ansible_facts.services['k3s.service'] is defined
         - ansible_facts.services['k3s.service'].state == 'running'
-        - k3s_server_config_result.changed
       ansible.builtin.service:
         name: k3s
         state: restarted
@@ -310,29 +320,58 @@
         state: started
         enabled: true
 
-    - name: Verify that all server nodes joined
-      when: not ansible_check_mode and (groups[server_group] | length) > 1
+    - name: Verify that the servers started so far joined
+      when: not ansible_check_mode
       ansible.builtin.command:
         cmd: >
           k3s kubectl get nodes -l "node-role.kubernetes.io/control-plane=true" -o=jsonpath="{.items[*].metadata.name}"
       register: k3s_server_nodes
-      until: k3s_server_nodes.rc == 0 and (k3s_server_nodes.stdout.split() | length) == (groups[server_group] | length)
+      until:
+        - k3s_server_nodes.rc == 0
+        - (k3s_server_nodes.stdout.split() | length) >= (k3s_server_started_count | int)
       retries: 20
       delay: 10
       changed_when: false
 
 - name: Wait for control plane to be ready
-  ansible.builtin.wait_for:
-    host: "{{ api_endpoint }}"
-    port: "{{ api_port }}"
-    timeout: 60
   run_once: true
+  block:
+    - name: Wait for control plane using api_endpoint
+      ansible.builtin.wait_for:
+        host: "{{ api_endpoint }}"
+        port: "{{ api_port }}"
+        timeout: 60
+      changed_when: false
+
+  rescue:
+    - name: Wait for control plane using localhost
+      ansible.builtin.wait_for:
+        host: localhost
+        port: "{{ api_port }}"
+        timeout: 60
+      changed_when: false
+
+- name: Wait for the servers started so far to be etcd voters
+  when:
+    - not ansible_check_mode
+    - (groups[server_group] | length) > 1
+    - not use_external_database
+  ansible.builtin.command:
+    cmd: >-
+      k3s kubectl --request-timeout=10s get nodes -l "node-role.kubernetes.io/etcd=true"
+      -o=jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="EtcdIsVoter")].status}{"\n"}{end}'
+  register: k3s_server_etcd_voters
+  until:
+    - k3s_server_etcd_voters.rc == 0
+    - (k3s_server_etcd_voters.stdout.split() | length) >= (k3s_server_started_count | int)
+    - (k3s_server_etcd_voters.stdout.split() | reject('search', '=True$') | list | length) == 0
+  retries: 30
+  delay: 10
   changed_when: false
 
 - name: Setup kubectl for user
   when: user_kubectl
   block:
-
     - name: Create directory .kube
       ansible.builtin.file:
         path: ~{{ ansible_user }}/.kube
@@ -341,6 +380,7 @@
         mode: "u=rwx,g=rx,o="
 
     - name: Copy config file to user home directory
+      when: not ansible_check_mode
       ansible.builtin.copy:
         src: /etc/rancher/k3s/k3s.yaml
         dest: ~{{ ansible_user }}/.kube/config

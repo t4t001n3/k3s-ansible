@@ -20,7 +20,7 @@ on processor architectures:
 
 ## System requirements
 
-The control node **must** have Ansible 8.0+ (ansible-core 2.15+)
+The control node **must** have Ansible 8.0+ (ansible-core 2.15+) and the Python `netaddr` library (`pip install netaddr`), required by the `ansible.utils.ipwrap` filter for IPv6 `api_endpoint` support.
 
 All managed nodes in inventory must have:
 - Passwordless SSH access
@@ -144,6 +144,16 @@ The `use_external_database` flag is required when more than one server is define
 
 The format of the datastore-endpoint parameter is dependent upon the datastore backend, please visit the [K3s datastore endpoint format](https://docs.k3s.io/datastore#datastore-endpoint-format-and-functionality) for details on the format and supported datastores.
 
+### Server config file permissions
+
+The server role writes `/etc/rancher/k3s/config.yaml` at mode `0644`. That file can contain the cluster token, so any local account on a server node can read the credential that joins a node to the cluster. Set `k3s_server_config_mode` to narrow it:
+
+```yaml
+k3s_server_config_mode: "0640"
+```
+
+K3s reads the file as root, so `0600` is the safe floor: no other account needs the file. The default stays `0644`, which is the mode the file already has on a running cluster, so a re-run changes nothing until the variable is set. The upgrade role rewrites the same file and honors the same variable.
+
 ## Upgrading
 
 A playbook is provided to upgrade K3s on all nodes in the cluster. To use it, update `k3s_version` with the desired version in `inventory.yml` and run one of the following commands. Again, the syntax is slightly different depending on whether you installed `k3s-ansible` with `ansible-galaxy` or if you run the playbook from within the cloned git repository:
@@ -160,6 +170,14 @@ ansible-playbook k3s.orchestration.upgrade -i inventory.yml
 ```bash
 ansible-playbook playbooks/upgrade.yml -i inventory.yml
 ```
+
+Re-running the `site.yml` playbook after bumping `k3s_version` performs the same upgrade declaratively: it restarts the k3s services so the cluster picks up the new runtime. On a multi-server (HA) cluster, add `-e k3s_server_serial=1` so the servers restart one at a time and etcd keeps quorum. With embedded etcd, the next server restarts only after the restarted ones report as etcd voters. By default all servers restart together. Set it through extra vars or `import_playbook` vars, not inventory: `serial` is a play keyword, so inventory variables don't apply to it.
+
+```bash
+ansible-playbook playbooks/site.yml -i inventory.yml -e k3s_server_serial=1
+```
+
+The dedicated `upgrade.yml` playbook remains available and unchanged.
 
 ## Airgap Install
 
@@ -220,9 +238,8 @@ By default, each node is given 2 cores and 2GB of RAM and runs Ubuntu 24.04. You
 ## Need More Features?
 
 This project is intended to provide a "vanilla" K3s install. If you need more features, such as:
-- Private Registry
 - Advanced Storage (Longhorn, Ceph, etc)
-- External Database
+- External Database Management
 - External Load Balancer or VIP
 - Alternative CNIs
 

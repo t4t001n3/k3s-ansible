@@ -14,6 +14,7 @@ problems hit along the way.
 | GitOps repo watched by Argo CD | `~/DEV/homelab-gitops` (private repo `t4t001n3/homelab-gitops`) |
 | Control node | `penguin` (x86_64), runs Ansible and kubectl |
 | HTTPS with the home CA | [`argocd-tls-home-ca.md`](argocd-tls-home-ca.md) |
+| LAN DNS / ad blocking (planned) | Pi-hole in a Proxmox LXC, see Part 5 |
 
 | Cluster | Server | Agents | API |
 |---|---|---|---|
@@ -460,6 +461,88 @@ starting), but it joined a few seconds later.
 
 ---
 
+## Part 5: Pi-hole on Proxmox
+
+> **Status: planned, not deployed yet.** `10.0.0.53` below is the
+> intended address; pick any free IP outside the router's DHCP range.
+
+Pi-hole runs in an unprivileged Debian LXC container on Proxmox, not in
+k3s. DNS for the whole LAN shouldn't depend on the clusters, and gandalf's
+IP change (Part 4) shows what happens when a core service's address moves.
+
+### 5.1 Create the container
+
+Either use the community script from the Proxmox node's Shell (choose
+**Advanced** to set a static IP; read the script first):
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/pihole.sh)"
+```
+
+Or by hand. Download a Debian template on the node:
+
+```bash
+pveam update
+pveam available | grep debian
+pveam download local debian-12-standard_<version>_amd64.tar.zst   # exact name from the list
+```
+
+Then **Create CT** in the web UI:
+
+| Setting | Value |
+|---|---|
+| Unprivileged | yes |
+| Template | Debian 12 (or 13) |
+| Disk / CPU / RAM | 8 GB / 1 core / 512 MB |
+| Network | `vmbr0`, static `10.0.0.53/24`, gateway = the router |
+| DNS (during install) | `1.1.1.1` |
+| Options | **Start at boot** on |
+
+### 5.2 Install Pi-hole
+
+In the container's console:
+
+```bash
+apt update && apt upgrade -y
+apt install -y curl
+curl -sSL https://install.pi-hole.net | bash   # defaults: eth0, pick an upstream
+pihole setpassword
+```
+
+The admin UI is at `http://10.0.0.53/admin`.
+
+### 5.3 Point the LAN at it
+
+- In the router's DHCP settings, set `10.0.0.53` as the **only** DNS
+  server. A secondary public resolver (e.g. `8.8.8.8`) lets clients bypass
+  blocking.
+- Alternatively, turn off the router's DHCP and enable Pi-hole's
+  (*Settings → DHCP*). That also gives one place for the server
+  reservations from Part 4.
+
+Check from the control node:
+
+```bash
+nslookup doubleclick.net 10.0.0.53   # should return 0.0.0.0
+nslookup github.com 10.0.0.53        # should resolve normally
+```
+
+### 5.4 Local names instead of nip.io (optional)
+
+Pi-hole can serve local hostnames, so the Ingresses no longer need to embed
+gandalf's IP:
+
+- Single names: *Settings → Local DNS Records*, e.g. `argocd.home` →
+  `10.0.0.125`.
+- Wildcard for all cluster1 services (Pi-hole v6): *Settings → All
+  settings → `misc.dnsmasq_lines`*, add `address=/home/10.0.0.125`.
+
+Switching to these names means updating the Argo CD Ingress and the
+homelab-gitops hostnames (same places as Part 4, steps 4–5), and reissuing
+the certificates with the new names.
+
+---
+
 ## Open items
 
 - [ ] DHCP reservations for the servers, so their IPs can't change again.
@@ -472,3 +555,6 @@ starting), but it joined a few seconds later.
 - [ ] Monitoring for cluster2: install Argo CD there, or register cluster2
       in cluster1's Argo CD (`argocd cluster add k3s-cluster2`), and add a
       `clusters/k3s-cluster2/` tree.
+- [ ] Deploy Pi-hole on Proxmox (Part 5) and set it as the LAN's DNS.
+- [ ] Optionally move the cluster1 hostnames from `*.10.0.0.125.nip.io`
+      to local `*.home` names served by Pi-hole.

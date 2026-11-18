@@ -18,10 +18,15 @@ problems hit along the way.
 | Cluster | Server | Agents | API |
 |---|---|---|---|
 | `k3s-cluster1` | gandalf | aragorn, legolas, gimli, boromir | `https://10.0.0.125:6443` (was `10.0.0.13`) |
-| `k3s-cluster2` | shire | frodo, sam, pippin, merry | `https://10.0.0.233:6443` |
+| `k3s-cluster2` | shire | frodo, sam, pippin, merry | `https://10.0.0.148:6443` (was `10.0.0.233`) |
 
-All nodes run k3s `v1.37.1+k3s1`. sam and merry register as `p2` and `p3`,
-because those are their OS hostnames.
+All nodes run k3s `v1.37.1+k3s1`. sam registers as `p2`, its OS hostname.
+merry registered as `p3` until its reinstall on 2026-11-17; it now registers
+as `merry`.
+
+Every node has a DHCP reservation on the router since 2026-11-17: cluster1
+uses `10.0.0.125` (gandalf) to `.129`, cluster2 uses `10.0.0.148` (shire) to
+`.152`.
 
 The cluster2 agents (10.0.0.149–152) connect through shire's bridge `br0`
 (interfaces `ethpi1`–`ethpi4`). If shire reboots or loses power, all of
@@ -99,7 +104,7 @@ all:
         server2:
           hosts:
             shire:
-              ansible_host: 10.0.0.233
+              ansible_host: 10.0.0.148
         agent2:
           hosts: { frodo:, sam:, pippin:, merry: }
       vars:
@@ -455,20 +460,21 @@ cert-manager issued new certificates for the new hostnames automatically.
 In step 3, legolas reported a failed restart (a timeout while k3s was still
 starting), but it joined a few seconds later.
 
-**To avoid this:** set a DHCP reservation on the router for each server
-(gandalf `10.0.0.125`, shire `10.0.0.233`), or better, for every Pi.
+**To avoid this:** set a DHCP reservation on the router for each server,
+or better, for every Pi. Done on 2026-11-17 for all ten nodes (gandalf
+`10.0.0.125`, shire `10.0.0.148`).
 
 ---
 
 ## Open items
 
-- [ ] DHCP reservations for the servers, so their IPs can't change again.
+- [x] DHCP reservations for every node, so their IPs can't change again (2026-11-17).
       If one does change, follow Part 4 for that cluster (inventory,
       kubeconfig, rerun `site.yml`).
 - [ ] Encrypt the cluster tokens with ansible-vault.
 - [ ] Commit the playbook changes and `docs/` in k3s-ansible, and the
       inventory changes in ansible-inventory.
-- [ ] Optionally rename the `p2`/`p3` hostnames on sam and merry.
+- [ ] Optionally rename the `p2` hostname on sam (merry is already `merry`).
 - [ ] Monitoring for cluster2: install Argo CD there, or register cluster2
       in cluster1's Argo CD (`argocd cluster add k3s-cluster2`), and add a
       `clusters/k3s-cluster2/` tree.

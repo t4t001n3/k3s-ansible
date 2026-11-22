@@ -20,7 +20,7 @@ problems hit along the way.
 | `k3s-cluster1` | gandalf | aragorn, legolas, gimli, boromir | `https://10.0.0.125:6443` (was `10.0.0.13`) |
 | `k3s-cluster2` | shire | frodo, sam, pippin, merry | `https://10.0.0.148:6443` (was `10.0.0.233`) |
 
-All nodes run k3s `v1.37.1+k3s1`. sam registers as `p2`, its OS hostname.
+All nodes run k3s `v1.37.1+k3s1`. sam was renamed from `p2` on 2026-11-21.
 merry registered as `p3` until its reinstall on 2026-11-17; it now registers
 as `merry`.
 
@@ -474,7 +474,7 @@ or better, for every Pi. Done on 2026-11-17 for all ten nodes (gandalf
 - [ ] Encrypt the cluster tokens with ansible-vault.
 - [ ] Commit the playbook changes and `docs/` in k3s-ansible, and the
       inventory changes in ansible-inventory.
-- [ ] Optionally rename the `p2` hostname on sam (merry is already `merry`).
+- [x] Rename the `p2` hostname on sam (2026-11-21; merry is already `merry`).
 - [ ] Monitoring for cluster2: install Argo CD there, or register cluster2
       in cluster1's Argo CD (`argocd cluster add k3s-cluster2`), and add a
       `clusters/k3s-cluster2/` tree.

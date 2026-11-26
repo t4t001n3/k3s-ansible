@@ -351,8 +351,13 @@ kubectl --context k3s-cluster1 -n argocd create secret generic repo-homelab-gito
 kubectl --context k3s-cluster1 -n argocd label secret repo-homelab-gitops \
   argocd.argoproj.io/secret-type=repository
 
-shred -u key && rm key.pub      # the private key now lives only in the cluster
+shred -u key && rm key.pub
 ```
+
+The private key is also backed up, encrypted, as `argocd_repo_ssh_private_key`
+in the inventory's `group_vars/k3s_cluster1.sops.yml` (homelab-gitops #150).
+To recreate the Secret after a rebuild, follow "Recréer le Secret d'Argo CD"
+in the ansible-inventory `README.md`: no new key is needed.
 
 ### 3.4 The kube-prometheus-stack Application
 

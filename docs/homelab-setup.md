@@ -125,10 +125,11 @@ Notes:
   address agents use to join. With only the bare hostname, the agents
   couldn't resolve `gandalf` and never joined.
 - **Tokens** were generated with `openssl rand -hex 32`, one per cluster.
-  They're stored in plain text in the inventory, which is a private repo.
-  To encrypt them, use
-  `ansible-vault encrypt_string --name token '<value>'` and run the
-  playbooks with `--ask-vault-pass`.
+  They're encrypted with SOPS + age in the inventory, in
+  `group_vars/k3s_cluster1.sops.yml` and `k3s_cluster2.sops.yml`
+  (homelab-gitops #119). `ansible.cfg` enables the `community.sops` vars
+  plugin, which decrypts them with `~/.config/sops/age/keys.txt`.
+  **Never regenerate a token** on a running cluster.
 - `cluster_context` names the kubeconfig context for each cluster.
 
 ### 1.3 Control node prerequisites
@@ -471,7 +472,7 @@ or better, for every Pi. Done on 2026-11-17 for all ten nodes (gandalf
 - [x] DHCP reservations for every node, so their IPs can't change again (2026-11-17).
       If one does change, follow Part 4 for that cluster (inventory,
       kubeconfig, rerun `site.yml`).
-- [ ] Encrypt the cluster tokens with ansible-vault.
+- [x] Encrypt the cluster tokens with SOPS + age (homelab-gitops #119).
 - [ ] Commit the playbook changes and `docs/` in k3s-ansible, and the
       inventory changes in ansible-inventory.
 - [x] Rename the `p2` hostname on sam (2026-11-21; merry is already `merry`).

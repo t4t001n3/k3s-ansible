@@ -424,7 +424,61 @@ doesn't allow cross-namespace middleware by default.
 
 ---
 
-## Part 4: Changing the control-plane IP
+## Part 4: Changing a server's IP
+
+Both servers have moved once: gandalf by hand (4.2), shire with an extra
+failure that the gandalf fix doesn't cover (4.3).
+`playbooks/change-server-ip.yml` now does the k3s side of both
+(homelab-gitops #125). It handles one-server clusters only.
+
+### 4.1 With the playbook
+
+1. Change the DHCP reservation on the router. The host only takes the new
+   IP when its lease renews: `sudo dhclient -r` then `sudo reboot` (this
+   cuts the SSH session, so it stays a manual step).
+2. In `~/DEV/ansible-inventory/inventory.yml`, set the new IP as the
+   server's `ansible_host` and in `k3s_tls_san`. `k3s_tls_san` lists every
+   IP the API certificate must cover. You can keep the old IP there while
+   clients still use it, e.g. `k3s_tls_san: [10.0.0.148, 10.0.0.233]`.
+3. Dry run, then the real run:
+
+```bash
+cd ~/DEV/k3s-ansible
+INV=~/DEV/ansible-inventory/inventory.yml
+X="-e cluster_group=k3s_cluster2 -e server_group=server2 -e agent_group=agent2"
+./venv/bin/ansible-playbook -i $INV playbooks/change-server-ip.yml $X --check --diff
+./venv/bin/ansible-playbook -i $INV playbooks/change-server-ip.yml $X
+./venv/bin/ansible-playbook -i $INV playbooks/change-server-ip.yml $X --check --diff  # changed=0
+```
+
+What it does:
+
+- **Checks** that the new IP is on the host and listed in `k3s_tls_san`.
+  Otherwise it stops before touching anything.
+- **Server, pass 1**, only if the Node still announces another IP (or the
+  API doesn't answer): it writes `config.yaml` with
+  `disable-network-policy: true` (keeping a backup), restarts k3s, and waits
+  until `.status.addresses` shows the new IP.
+- **Server, pass 2**: it writes `config.yaml` exactly as `site.yml` does
+  (same tasks, `roles/k3s_server/tasks/config.yml`), so without the option,
+  and restarts k3s if the file changed. Then it waits for the Node to be
+  Ready on the new IP.
+- **Agents**: an agent whose unit still points at the old server URL gets
+  reinstalled by the `k3s_agent` role. An agent whose Node announces an IP
+  other than its own gets `k3s-agent` restarted, because the agent keeps
+  the IP it picked at startup. That covers aragorn after its switch from
+  Wi-Fi to Ethernet.
+- **Follow-ups**: at the end, it prints what lives outside k3s, in
+  homelab-gitops: `git grep` for the old IP, then `control-node.yml`
+  (`/etc/hosts` and kubeconfig of penguin), `pihole-dns.yml` (record and
+  `*.cN` wildcard), `host-files.yml --limit sauron` (Prometheus targets).
+  The kubeconfig uses the names `gandalf` and `shire`, so `/etc/hosts` is
+  enough there.
+
+`config.yaml` holds the cluster token. The playbook never prints the file
+diff; it shows a before/after copy without the token instead.
+
+### 4.2 gandalf, `10.0.0.13` → `10.0.0.125` (by hand)
 
 gandalf's IP changed from `10.0.0.13` to `10.0.0.125`. Two things broke:
 
@@ -466,17 +520,46 @@ cert-manager issued new certificates for the new hostnames automatically.
 In step 3, legolas reported a failed restart (a timeout while k3s was still
 starting), but it joined a few seconds later.
 
+Since then, `*.c1.lab.home.arpa` names have replaced the `nip.io` ones
+(homelab-gitops #3): only the Pi-hole DNS (records and wildcard)
+follows the IP, and the Ingresses stay as they are.
+
 **To avoid this:** set a DHCP reservation on the router for each server,
 or better, for every Pi. Done on 2026-11-17 for all ten nodes (gandalf
 `10.0.0.125`, shire `10.0.0.148`).
+
+### 4.3 shire, `10.0.0.233` → `10.0.0.148`: k3s stops in a loop
+
+Done by hand on 2026-11-17, before the playbook existed. Unlike gandalf,
+the server itself broke. k3s exited by itself (code 0, so `Restart=always`
+restarted it, over and over) with:
+
+```
+failed to start networking: unable to initialize network policy controller:
+error getting node subnet: failed to find interface with specified node ip
+```
+
+The Node object still had the old InternalIP, and the API only answered
+now and then. Fix:
+
+1. In `/etc/rancher/k3s/config.yaml`: `tls-san` = [new IP, old IP], plus
+   **temporarily** `disable-network-policy: true`. Restart k3s.
+2. Once the Node announces the new IP (`kubectl get node shire -o
+   jsonpath='{.status.addresses}'`), remove that line and restart again.
+
+Backup of the original file: `config.yaml.bak-ipchange-20261117`. Since
+that evening the file only has `tls-san: 10.0.0.148`; the certificate
+still lists both IPs, because k3s keeps the SANs it already has. Nothing
+recorded which `tls-san` a host needs, and any `site.yml` run rewrites the
+file: that is why `tls-san` now comes from the inventory (`k3s_tls_san`)
+and why the playbook reuses the `k3s_server` role's tasks.
 
 ---
 
 ## Open items
 
 - [x] DHCP reservations for every node, so their IPs can't change again (2026-11-17).
-      If one does change, follow Part 4 for that cluster (inventory,
-      kubeconfig, rerun `site.yml`).
+      If one does change, follow Part 4.1 (`playbooks/change-server-ip.yml`).
 - [x] Encrypt the cluster tokens with SOPS + age (homelab-gitops #119).
 - [ ] Commit the playbook changes and `docs/` in k3s-ansible, and the
       inventory changes in ansible-inventory.

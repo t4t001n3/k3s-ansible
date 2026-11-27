@@ -81,8 +81,15 @@
               false
               {% endif %}
 
+        # Same rule as roles/k3s_server/tasks/config.yml.
+        - name: Add TLS SANs from the inventory
+          when: k3s_tls_san is defined
+          ansible.builtin.set_fact:
+            k3s_server_config: "{{ k3s_server_config | combine({'tls-san': k3s_tls_san[0] if k3s_tls_san | length == 1 else k3s_tls_san}) }}"
+
         - name: Add TLS SAN to config if needed
           when:
+            - k3s_tls_san is not defined
             - api_endpoint is defined
             - api_endpoint != ansible_facts['hostname']
             - not (_api_endpoint_in_config | trim | bool)

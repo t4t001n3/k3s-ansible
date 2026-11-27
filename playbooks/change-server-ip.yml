@@ -1,0 +1,231 @@
+---
+# Moves a single-server k3s cluster to the server IP now in the inventory
+# (ansible_host, and k3s_tls_san), after a DHCP reservation change
+# (homelab-gitops#125). Guide: docs/homelab-setup.md, Part 4.
+#
+# Server, when its Node still announces another IP (or the API is down):
+#   pass 1: config.yaml + "disable-network-policy: true", restart k3s, wait
+#           for the new IP in the Node's .status.addresses;
+#   pass 2: config.yaml exactly as site.yml writes it, restart k3s.
+# Without that, k3s exits in a loop: "unable to initialize network policy
+# controller: ... failed to find interface with specified node ip".
+# Agents: reinstalled when their unit points to another server URL, k3s-agent
+# restarted when their Node announces another IP (it keeps the one it had at
+# startup).
+# Nothing to do, nothing changed: a second run reports changed=0.
+# config.yaml holds the token: the real diff is never printed, only a copy
+# with the token removed.
+#
+#   ./venv/bin/ansible-playbook -i ~/DEV/ansible-inventory/inventory.yml \
+#     playbooks/change-server-ip.yml \
+#     -e cluster_group=k3s_cluster2 -e server_group=server2 -e agent_group=agent2 \
+#     --check --diff
+
+- name: Move the k3s server to its inventory IP
+  hosts: "{{ server_group | default('server') }}"
+  gather_facts: true
+  become: true
+  vars:
+    change_ip_node: "{{ ansible_facts['hostname'] }}"
+    change_ip_config: /etc/rancher/k3s/config.yaml
+    change_ip_jsonpath: jsonpath={.status.addresses[?(@.type=="InternalIP")].address}
+  tasks:
+    - name: Check the inventory against the host
+      ansible.builtin.assert:
+        that:
+          - groups[server_group] | length == 1
+          - k3s_tls_san is defined
+          - ansible_host in k3s_tls_san
+          - ansible_host in ansible_facts['all_ipv4_addresses']
+        fail_msg: >-
+          Needs one server per cluster (with several, the etcd peers move too),
+          k3s_tls_san in the inventory listing ansible_host ({{ ansible_host }}),
+          and that IP on the host ({{ ansible_facts['all_ipv4_addresses'] | join(', ') }}).
+          If the reservation changed but the host still has its old lease,
+          renew it first (dhclient -r, then reboot).
+
+    - name: Build config.yaml as site.yml does
+      ansible.builtin.include_role:
+        name: k3s_server
+        tasks_from: config.yml
+        public: true  # k3s_server_config_mode, from the role defaults
+
+    - name: Read the current config.yaml
+      ansible.builtin.slurp:
+        src: "{{ change_ip_config }}"
+      register: change_ip_slurp
+
+    - name: Read the IP the Node announces
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, node, "{{ change_ip_node }}", -o, "{{ change_ip_jsonpath }}"]
+      register: change_ip_node_ip
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      retries: 6
+      delay: 10
+      until: change_ip_node_ip.rc == 0
+
+    - name: Decide what has to change
+      ansible.builtin.set_fact:
+        change_ip_repair: "{{ change_ip_node_ip.rc != 0 or change_ip_node_ip.stdout != ansible_host }}"
+        change_ip_old: "{{ change_ip_node_ip.stdout if change_ip_node_ip.rc == 0 and change_ip_node_ip.stdout != ansible_host else '' }}"
+        change_ip_current: "{{ change_ip_slurp.content | b64decode | from_yaml | default({}, true) }}"
+
+    - name: Show config.yaml before and after, token removed
+      when: change_ip_repair | bool or change_ip_current != k3s_server_config
+      ansible.builtin.debug:
+        msg:
+          node_announces: "{{ change_ip_node_ip.stdout if change_ip_node_ip.rc == 0 else 'API not answering' }}"
+          inventory_ip: "{{ ansible_host }}"
+          two_passes: "{{ change_ip_repair }}"
+          before: "{{ change_ip_current | dict2items | rejectattr('key', 'eq', 'token') | items2dict }}"
+          after: "{{ k3s_server_config | dict2items | rejectattr('key', 'eq', 'token') | items2dict }}"
+
+    - name: "Pass 1: without the network policy controller"
+      when: change_ip_repair | bool
+      block:
+        - name: "Pass 1: write config.yaml with disable-network-policy"
+          ansible.builtin.copy:
+            content: "{{ k3s_server_config | combine({'disable-network-policy': true}) | to_nice_yaml }}"
+            dest: "{{ change_ip_config }}"
+            mode: "{{ k3s_server_config_mode }}"
+            backup: true
+          diff: false
+
+        - name: "Pass 1: restart k3s"
+          when: not ansible_check_mode
+          ansible.builtin.service:
+            name: k3s
+            state: restarted
+
+        - name: "Pass 1: wait for the new IP in .status.addresses"
+          when: not ansible_check_mode
+          ansible.builtin.command:
+            argv: [k3s, kubectl, get, node, "{{ change_ip_node }}", -o, "{{ change_ip_jsonpath }}"]
+          register: change_ip_wait
+          changed_when: false
+          retries: 60
+          delay: 10
+          until: change_ip_wait.rc == 0 and change_ip_wait.stdout == ansible_host
+
+    - name: "Pass 2: write config.yaml as site.yml does"
+      ansible.builtin.copy:
+        content: "{{ k3s_server_config | to_nice_yaml }}"
+        dest: "{{ change_ip_config }}"
+        mode: "{{ k3s_server_config_mode }}"
+        backup: "{{ not change_ip_repair | bool }}"
+      diff: false
+      register: change_ip_final
+
+    - name: "Pass 2: restart k3s"
+      when:
+        - change_ip_final is changed
+        - not ansible_check_mode
+      ansible.builtin.service:
+        name: k3s
+        state: restarted
+
+    - name: "Pass 2: wait for the Node to be Ready on the new IP"
+      when:
+        - change_ip_final is changed
+        - not ansible_check_mode
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - node
+          - "{{ change_ip_node }}"
+          - -o
+          - jsonpath={.status.addresses[?(@.type=="InternalIP")].address} {.status.conditions[?(@.type=="Ready")].status}
+      register: change_ip_ready
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: change_ip_ready.rc == 0 and change_ip_ready.stdout == ansible_host ~ ' True'
+
+- name: Point the agents to the server's IP
+  hosts: "{{ agent_group | default('agent') }}"
+  gather_facts: true
+  become: true
+  vars:
+    change_ip_server: "{{ groups[server_group][0] }}"
+    change_ip_url: "https://{{ api_endpoint | ansible.utils.ipwrap }}:{{ api_port | default(6443) }}"
+    change_ip_node: "{{ ansible_facts['hostname'] }}"
+    change_ip_expected: "{{ ansible_facts['default_ipv4']['address'] }}"
+    change_ip_jsonpath: jsonpath={.status.addresses[?(@.type=="InternalIP")].address}
+  tasks:
+    - name: Read the k3s-agent unit
+      ansible.builtin.slurp:
+        src: "{{ systemd_dir | default('/etc/systemd/system') }}/k3s-agent.service"
+      register: change_ip_unit
+
+    # The install script quotes each argument: '--server' 'https://...:6443'
+    - name: Check the server URL in the unit
+      ansible.builtin.set_fact:
+        change_ip_reinstalled: >-
+          {{ ("'" ~ change_ip_url ~ "'") not in (change_ip_unit.content | b64decode) }}
+
+    - name: Reinstall the agent with the new server URL
+      when: change_ip_reinstalled | bool
+      ansible.builtin.include_role:
+        name: k3s_agent
+
+    - name: Read the IP the agent's Node announces
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, node, "{{ change_ip_node }}", -o, "{{ change_ip_jsonpath }}"]
+      delegate_to: "{{ change_ip_server }}"
+      register: change_ip_agent_ip
+      changed_when: false
+      check_mode: false
+      retries: 6
+      delay: 10
+      until: change_ip_agent_ip.rc == 0
+
+    - name: Restart k3s-agent so that it announces its current IP
+      when:
+        - change_ip_agent_ip.stdout != change_ip_expected
+        - not change_ip_reinstalled | bool
+      ansible.builtin.service:
+        name: k3s-agent
+        state: restarted
+
+    - name: Wait for the agent's Node to be Ready on its IP
+      when:
+        - change_ip_reinstalled | bool or change_ip_agent_ip.stdout != change_ip_expected
+        - not ansible_check_mode
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - node
+          - "{{ change_ip_node }}"
+          - -o
+          - jsonpath={.status.addresses[?(@.type=="InternalIP")].address} {.status.conditions[?(@.type=="Ready")].status}
+      delegate_to: "{{ change_ip_server }}"
+      register: change_ip_agent_ready
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: change_ip_agent_ready.rc == 0 and change_ip_agent_ready.stdout == change_ip_expected ~ ' True'
+
+- name: Follow-ups outside k3s
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    change_ip_server: "{{ groups[server_group | default('server')][0] }}"
+    change_ip_old: "{{ hostvars[change_ip_server]['change_ip_old'] | default('', true) or '<old IP>' }}"
+    change_ip_new: "{{ hostvars[change_ip_server]['ansible_host'] }}"
+  tasks:
+    - name: List what this playbook does not change
+      ansible.builtin.debug:
+        msg:
+          - "In ~/DEV/homelab-gitops, replace {{ change_ip_old }} with {{ change_ip_new }}: git grep -n -F '{{ change_ip_old }}'"
+          - "Then, from ~/DEV/homelab-gitops/ansible (each with --check --diff first):"
+          - "/etc/hosts and kubeconfig of the control node: vars/control_node.yml, playbooks/control-node.yml"
+          - "Pi-hole record and *.cN.lab.home.arpa wildcard: vars/pihole_dns.yml, playbooks/pihole-dns.yml"
+          - "Prometheus targets on sauron: hosts/sauron/etc/prometheus/prometheus.yml, playbooks/host-files.yml --limit sauron"
+          - "Optional: drop {{ change_ip_old }} from k3s_tls_san once nothing uses it."

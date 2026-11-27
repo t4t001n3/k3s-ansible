@@ -21,6 +21,29 @@
 #     -e cluster_group=k3s_cluster2 -e server_group=server2 -e agent_group=agent2 \
 #     --check --diff
 
+# Mixed flags (e.g. agent_group=agent1 with server_group=server2) would read
+# the agents' Nodes on the other cluster's server. Stop before any host.
+- name: Check that the three groups are one cluster
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Check cluster_group, server_group and agent_group
+      ansible.builtin.assert:
+        that:
+          - cluster_group is defined
+          - server_group is defined
+          - agent_group is defined
+          - groups[server_group] | default([]) | length > 0
+          - groups[server_group] | difference(groups[cluster_group] | default([])) | length == 0
+          - groups[agent_group] | default([]) | difference(groups[cluster_group] | default([])) | length == 0
+        fail_msg: >-
+          Pass the three groups of one cluster, e.g.
+          -e cluster_group=k3s_cluster1 -e server_group=server1 -e agent_group=agent1.
+          Got cluster_group={{ cluster_group | default('(none)') }},
+          server_group={{ server_group | default('(none)') }},
+          agent_group={{ agent_group | default('(none)') }}.
+
 - name: Move the k3s server to its inventory IP
   hosts: "{{ server_group | default('server') }}"
   gather_facts: true

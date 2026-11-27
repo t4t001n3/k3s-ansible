@@ -445,7 +445,8 @@ failure that the gandalf fix doesn't cover (4.3).
 ```bash
 cd ~/DEV/k3s-ansible
 INV=~/DEV/ansible-inventory/inventory.yml
-X="-e cluster_group=k3s_cluster2 -e server_group=server2 -e agent_group=agent2"
+C=2  # cluster number: 1 (gandalf) or 2 (shire)
+X="-e cluster_group=k3s_cluster$C -e server_group=server$C -e agent_group=agent$C"
 ./venv/bin/ansible-playbook -i $INV playbooks/change-server-ip.yml $X --check --diff
 ./venv/bin/ansible-playbook -i $INV playbooks/change-server-ip.yml $X
 ./venv/bin/ansible-playbook -i $INV playbooks/change-server-ip.yml $X --check --diff  # changed=0
@@ -453,7 +454,8 @@ X="-e cluster_group=k3s_cluster2 -e server_group=server2 -e agent_group=agent2"
 
 What it does:
 
-- **Checks** that the new IP is on the host and listed in `k3s_tls_san`.
+- **Checks** that the three groups belong to one cluster (a stale `X`
+  from the other cluster stops it), then that the new IP is on the host and listed in `k3s_tls_san`.
   Otherwise it stops before touching anything.
 - **Server, pass 1**, only if the Node still announces another IP (or the
   API doesn't answer): it writes `config.yaml` with
